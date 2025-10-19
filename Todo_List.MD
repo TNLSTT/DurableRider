@@ -1,11 +1,11 @@
 
 # Durability-Post — Development TODO - Assume Not Done unless [DONE] is printed on the line
 
-## 1. Core Setup
-- Initialize a new Node.js project with Express, Axios, QS, and PG dependencies.  
-- Create `.env` with all required keys: PORT, STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, STRAVA_VERIFY_TOKEN, OAUTH_REDIRECT_URI, DATABASE_URL.  
-- Add a `server.js` entry point using ES modules syntax (`type: module` in package.json).  
-- Connect to Postgres via `pg` Pool and auto-create the `athlete_tokens` table if missing.  
+## 1. Core Setup [DONE]
+- Initialize a new Node.js project with Express, Axios, QS, and PG dependencies. [DONE]
+- Create `.env` with all required keys: PORT, STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, STRAVA_VERIFY_TOKEN, OAUTH_REDIRECT_URI, DATABASE_URL. [DONE]
+- Add a `server.js` entry point using ES modules syntax (`type: module` in package.json). [DONE]
+- Connect to Postgres via `pg` Pool and auto-create the `athlete_tokens` table if missing. [DONE]
 
 ## 2. OAuth Integration
 - Implement `/oauth/start` endpoint that redirects user to Strava’s authorization URL with scopes `activity:read_all,activity:write`.  
