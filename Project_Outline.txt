@@ -1,0 +1,597 @@
+Love it. A Strava “durability analyst” that posts a short summary to each ride is doable and useful. Here’s how I’d scope it so you can ship an MVP fast, then harden it.
+
+What to post (succinct, ride-level “commentary”)
+
+Aerobic decoupling (Pw:HR %): % change in (power/HR) from first half → second half. Positive drift = fading aerobic efficiency; negative/flat = durable.
+
+Late-ride power vs fresh: Compare best 5-min (or 10-min) power in last third vs first third (or vs your 90-day PDC). Quantifies “can you still go?”
+
+Power@HR curve shift: Fit simple linear (or LOWESS) model of watts vs HR in early vs late windows; report Δwatts at a fixed HR (e.g., 150 bpm).
+
+Time-in-zone stability: Z2/Z3 share early vs late; big creep upward in HR with stable power = fatigue signal.
+
+Optional: Durable TSS (downweight early minutes, upweight late minutes) to better separate “junk Z2” from resilient work.
+
+Example post (as an activity description update, not overwriting the athlete’s own text—append your block at the bottom):
+
+Durability Analysis
+• Pw:HR drift: +6.2% (watch fueling/heat or pacing)
+• 5-min power late vs early: −18 W
+• Power@150 bpm: −9 W vs first half
+• Z2 share: 63% → 47%
+
+Data you need & where to get it
+
+Pull activity streams: watts, heartrate, time (and optionally distance, altitude, velocity_smooth, cadence) via Strava’s Activity Streams endpoints. You’ll authenticate and request scopes accordingly. 
+developers.strava.com
+
+Use webhooks to get notified when an activity is created, then fetch streams, compute, and post results. Webhooks fire on activity create/update/delete; some fields (privacy, etc.) require activity:read_all. 
+developers.strava.com
++1
+
+Scopes: request activity:read_all (to read private activities) and activity:write (to edit descriptions). 
+developers.strava.com
++1
+
+Rate limits (plan batching/backoff): default ~200 requests/15 min, 2,000/day overall; 100/15 min and 1,000/day for non-upload endpoints. (Strava’s docs have evolved; check your app’s limits in dashboard.) 
+developers.strava.com
++1
+
+Posting mechanism: safest/official is PATCH activity description (append your block). Commenting via API is not clearly documented/guaranteed; community threads discuss it but rely on changing policies—use description updates for reliability. 
+developers.strava.com
++1
+
+Policy note: Strava tightened API terms around data usage (not for AI model training; show a user’s data only to that user). Design your UX accordingly. 
+The Verge
+
+MVP algorithm (robust + simple)
+
+Fetch streams at 1–5 s resolution; clean:
+
+Drop zeros when coasting if you’re computing decoupling (or keep, but be consistent).
+
+Remove HR outliers (e.g., <40 or >220 bpm).
+
+Respect pauses (Strava moving time can help).
+
+Split ride into halves or terciles by elapsed time (or moving time).
+
+Pw:HR drift (TrainingPeaks-style):
+
+Compute mean(power)/mean(HR) for H1 and H2 (or use NP instead of mean power).
+
+drift = ( (Pw/HR)_H2 / (Pw/HR)_H1 - 1 ) * 100.
+
+Late-vs-early power: rolling best 5-min (or 10-min) in last third minus best in first third.
+
+Power@HR shift: bin HR (e.g., 5-bpm bins). For bins with ≥60 s in both windows, compute avg power; report Δ at your anchor HR (use athlete’s median Z2 HR or 150 bpm fallback).
+
+Z distribution: simple Coggan zones from FTP (let user set FTP), compare early vs late.
+
+Assemble summary text + optional link to a richer external report (charts).
+
+Architecture (keep it light)
+
+Backend: FastAPI/Node (Express) + queue (e.g., Redis) to process webhook events.
+
+Storage: Postgres (athlete tokens + preferences), S3/R2 if you later render charts as images.
+
+Flow:
+
+Athlete OAuths → you store access_token, refresh_token, scopes.
+
+Webhook “activity created” → enqueue job.
+
+Job fetches activity + streams → compute metrics.
+
+PATCH description (append your block). 
+developers.strava.com
++1
+
+Rate-limit strategy: consolidate stream requests (ask only for types you need), exponential backoff, and a “retry after 5–10 min” worker. 
+developers.strava.com
+
+Edge cases you should handle
+
+No power or no HR → skip specific metrics; post only those computable (“No HR detected—decoupling skipped.”).
+
+Indoor/virtual rides (ERG) → decoupling often minimal; flag as “trainer ride” using trainer/type fields and adjust copy.
+
+Short rides (<40 min) → halves too small; use terciles or time-based thresholds.
+
+Heat/altitude → drift can reflect environment; optionally read weather/altitude trend to annotate.
+
+User description safety: don’t overwrite; append and include a signature block marker, e.g., <!-- durability-app v0.1 -->, so you can idempotently update.
+
+Nice v1.1 upgrades
+
+Per-athlete durability baseline: maintain a rolling 8-week table of Pw:HR vs ride duration; classify today as “Better / Typical / Worse”.
+
+Contextual tips: if drift > +7% and carbs < ~60 g/h (if they log), nudge fueling; if drift high + hot day, note heat acclimation.
+
+Charts: post a hosted PNG (watts@HR early vs late) and link it; Strava image upload via API isn’t guaranteed for all apps, so treat as optional and compliant with terms. 
+The Verge
+
+Why this will resonate
+
+Riders feel “I faded,” but can’t quantify it. Posting a clean, two-line durability verdict right on the activity closes that loop without leaving Strava.
+
+Coaches can skim feeds and spot “+10% drift, late power −25 W” at a glance—actionable.
+
+If you want, I can sketch the endpoint list + exact request shapes (OAuth URL, webhook verify, streams GET, activity PATCH) and a minimal FastAPI or Express skeleton you can paste in and run.
+
+You said:
+
+If you want, I can sketch the **endpoint list + exact request shapes** (OAuth URL, webhook verify, streams GET, activity PATCH) and a minimal **FastAPI or Express** skeleton you can paste in and run. ![](https://www.google.com/s2/favicons?domain=https://www.theverge.com&sz=32) ![](https://www.google.com/s2/favicons?domain=https://developers.strava.com&sz=32) Sources
+
+Do that. And add all your other commends to a scope document to create this app. THink hard
+ChatGPT said:
+Thought for 18s
+
+Awesome—here’s a tight, no-fluff scope you can build from today. I’ve included: (1) product spec, (2) Strava OAuth + webhook + streams request shapes, (3) minimal Express app you can paste and run, (4) algorithms, (5) storage schema, (6) ops & rate-limit strategy, (7) v1.1 roadmap and risks.
+
+Durability-Post (Scope v0.1)
+1) Problem & outcome
+
+Problem: Riders & coaches can’t quickly see late-ride resilience (do you fade?).
+Outcome: On every Strava Ride with power+HR, append a short, readable block to the activity description quantifying durability.
+
+MVP success: Within 60s of upload, activity shows:
+
+Pw:HR drift (%)
+
+Late vs early best 5-min power (ΔW)
+
+Power@anchor HR shift (ΔW at 150 bpm or athlete’s Z2 HR)
+
+Zone share drift (Z2 % early → late)
+
+Example appended block:
+
+Durability Analysis (v0.1)
+• Pw:HR drift: +6.2% (watch fueling/heat)
+• 5-min power late vs early: −18 W
+• Power@150 bpm: −9 W vs first half
+• Z2 share: 63% → 47%
+<!-- durability-post v0.1 -->
+
+2) Strava integration (exact pieces)
+Scopes
+
+Request activity:read_all,activity:write (comma-separated). activity:read_all covers “Only Me”; activity:write lets you update the activity description. 
+developers.strava.com
++1
+
+Webhooks
+
+Subscribe once; receive events when an activity is created/updated/deleted (and when access is revoked). For created/updated, fetch streams, compute, PATCH description. For privacy changes, note activity:read_all is required to see “Only Me” if you will update it. 
+developers.strava.com
+
+Endpoints you will use
+
+OAuth authorize: GET https://www.strava.com/oauth/authorize?client_id=...&redirect_uri=...&response_type=code&scope=activity:read_all,activity:write 
+developers.strava.com
+
+OAuth token exchange/refresh: POST https://www.strava.com/oauth/token (grant_type=authorization_code / refresh_token) 
+developers.strava.com
+
+Webhook mgmt (one-time admin): POST/GET/DELETE https://www.strava.com/api/v3/push_subscriptions (verify token challenge on your /webhook) 
+developers.strava.com
+
+Activity detail (optional sanity): GET /api/v3/activities/{id} (to read flags like trainer, private) 
+developers.strava.com
+
+Activity streams: GET /api/v3/activities/{id}/streams?keys=watts,heartrate,time,distance,altitude,velocity_smooth,cadence&key_by_type=true (requires activity:read or activity:read_all for Only Me) 
+developers.strava.com
+
+Update activity: PUT /api/v3/activities/{id} with {"description": "existing text...\n\nDurability Analysis ..."} (requires activity:write) 
+developers.strava.com
+
+Rate limits (plan your worker/backoff)
+
+Default app limits: 200 requests / 15 min, 2,000 / day overall; non-upload endpoints: 100 / 15 min, 1,000 / day. Design batching and retries accordingly. 
+developers.strava.com
+
+Policy notes (display & data usage)
+
+Strava tightened API terms (Nov 2024): don’t train AI on user data; only show a user’s Strava data to that same user. Your usage (per-user analysis posted to their own activity) is aligned. 
+The Verge
+
+3) Minimal Express app (paste-and-run skeleton)
+
+.env
+
+PORT=3000
+STRAVA_CLIENT_ID=xxxx
+STRAVA_CLIENT_SECRET=xxxx
+STRAVA_VERIFY_TOKEN=some-random-string      # for webhook validation handshake
+OAUTH_REDIRECT_URI=https://your.app/oauth/callback
+JWT_SECRET=devsecret                         # optional if you add sessions
+DATABASE_URL=postgres://user:pass@host/db   # tokens & prefs
+
+
+package.json (excerpt)
+
+{
+  "type": "module",
+  "scripts": { "dev": "node server.js" },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "express": "^4.19.2",
+    "p-limit": "^5.0.0",
+    "pg": "^8.11.3",
+    "qs": "^6.12.0"
+  }
+}
+
+
+server.js
+
+import express from "express";
+import axios from "axios";
+import crypto from "node:crypto";
+import qs from "qs";
+import { Pool } from "pg";
+
+const app = express();
+app.use(express.json());      // webhook JSON
+app.use(express.urlencoded({ extended: true }));
+
+const {
+  PORT = 3000,
+  STRAVA_CLIENT_ID,
+  STRAVA_CLIENT_SECRET,
+  OAUTH_REDIRECT_URI,
+  STRAVA_VERIFY_TOKEN,
+  DATABASE_URL
+} = process.env;
+
+const db = new Pool({ connectionString: DATABASE_URL });
+
+/** --- Utils --- */
+async function upsertAthleteToken({ athlete_id, access_token, refresh_token, expires_at, scope }) {
+  await db.query(`
+    INSERT INTO athlete_tokens (athlete_id, access_token, refresh_token, expires_at, scope)
+    VALUES ($1,$2,$3,to_timestamp($4),$5)
+    ON CONFLICT (athlete_id) DO UPDATE
+      SET access_token = EXCLUDED.access_token,
+          refresh_token = EXCLUDED.refresh_token,
+          expires_at = EXCLUDED.expires_at,
+          scope = EXCLUDED.scope`,
+    [athlete_id, access_token, refresh_token, expires_at, scope]);
+}
+
+async function getValidToken(athlete_id) {
+  const { rows } = await db.query(`SELECT * FROM athlete_tokens WHERE athlete_id=$1`, [athlete_id]);
+  if (!rows[0]) throw new Error("No token");
+  const t = rows[0];
+  const now = Math.floor(Date.now()/1000);
+  if (t.expires_at <= now + 60) {
+    // refresh
+    const r = await axios.post("https://www.strava.com/oauth/token", qs.stringify({
+      client_id: STRAVA_CLIENT_ID,
+      client_secret: STRAVA_CLIENT_SECRET,
+      grant_type: "refresh_token",
+      refresh_token: t.refresh_token
+    }));
+    await upsertAthleteToken({
+      athlete_id,
+      access_token: r.data.access_token,
+      refresh_token: r.data.refresh_token,
+      expires_at: r.data.expires_at,
+      scope: r.data.scope
+    });
+    return r.data.access_token;
+  }
+  return t.access_token;
+}
+
+/** --- OAuth start --- */
+app.get("/oauth/start", (req, res) => {
+  const scope = encodeURIComponent("activity:read_all,activity:write");
+  const redirect = `https://www.strava.com/oauth/authorize?client_id=${STRAVA_CLIENT_ID}&redirect_uri=${encodeURIComponent(OAUTH_REDIRECT_URI)}&response_type=code&approval_prompt=auto&scope=${scope}`;
+  res.redirect(redirect);
+});
+
+/** --- OAuth callback --- */
+app.get("/oauth/callback", async (req, res, next) => {
+  try {
+    const { code } = req.query;
+    const r = await axios.post("https://www.strava.com/oauth/token", qs.stringify({
+      client_id: STRAVA_CLIENT_ID,
+      client_secret: STRAVA_CLIENT_SECRET,
+      code,
+      grant_type: "authorization_code"
+    }));
+    const { athlete, access_token, refresh_token, expires_at, scope } = r.data;
+    await upsertAthleteToken({
+      athlete_id: athlete.id, access_token, refresh_token, expires_at, scope
+    });
+    res.send("Connected to Strava. You can close this tab.");
+  } catch (e) { next(e); }
+});
+
+/** --- Webhook verify (GET) --- */
+app.get("/webhook", (req, res) => {
+  const { "hub.challenge": challenge, "hub.verify_token": token } = req.query;
+  if (token !== STRAVA_VERIFY_TOKEN) return res.status(401).send("Bad verify token");
+  res.json({ "hub.challenge": challenge });
+});
+
+/** --- Webhook receiver (POST) --- */
+app.post("/webhook", async (req, res) => {
+  // ACK immediately to avoid timeouts; do processing async
+  res.sendStatus(200);
+  try {
+    const evt = req.body; // {object_type, object_id, aspect_type, updates, owner_id}
+    if (evt.object_type === "activity" && (evt.aspect_type === "create" || evt.aspect_type === "update")) {
+      await processActivity(evt.owner_id, evt.object_id);
+    }
+    if (evt.object_type === "athlete" && evt.aspect_type === "update" && evt.updates?.authorized === "false") {
+      await db.query(`DELETE FROM athlete_tokens WHERE athlete_id=$1`, [evt.owner_id]);
+    }
+  } catch (e) {
+    console.error("webhook error", e);
+  }
+});
+
+/** --- Core job --- */
+async function processActivity(athlete_id, activity_id) {
+  try {
+    const token = await getValidToken(athlete_id);
+
+    // 1) Fetch streams
+    const keys = ["watts","heartrate","time","distance","altitude","velocity_smooth","cadence"];
+    const url = `https://www.strava.com/api/v3/activities/${activity_id}/streams?${qs.stringify({keys: keys.join(","), key_by_type: true})}`;
+    const s = await axios.get(url, { headers: { Authorization: `Bearer ${token}` }});
+
+    const streams = s.data; // { time:{data:[]}, watts:{data:[]}, heartrate:{data:[]}, ... }
+    // 2) Compute metrics
+    const summary = computeDurability(streams);
+
+    if (!summary) return;
+
+    // 3) Append description (idempotent: strip old block)
+    const act = await axios.get(`https://www.strava.com/api/v3/activities/${activity_id}`, { headers: { Authorization: `Bearer ${token}` }});
+    const existing = act.data.description || "";
+    const cleansed = existing.replace(/\n?Durability Analysis \(v0\.1\)[\s\S]*?durability-post v0\.1 -->/m, "").trim();
+
+    const newDesc = (cleansed + "\n\n" + summary).trim();
+    await axios.put(`https://www.strava.com/api/v3/activities/${activity_id}`,
+      { description: newDesc },
+      { headers: { Authorization: `Bearer ${token}` }});
+  } catch (e) {
+    // TODO: backoff/retry on 429 or network errors
+    console.error("processActivity error", e?.response?.status, e?.response?.data || e.message);
+  }
+}
+
+/** --- Durability analytics --- */
+function computeDurability(streams) {
+  const t = streams.time?.data ?? [];
+  const p = streams.watts?.data ?? [];
+  const hr = streams.heartrate?.data ?? [];
+
+  if (t.length < 600 || p.length !== t.length || hr.length !== t.length) return null;
+
+  // simple cleaning
+  const clean = (arr, min, max) => arr.map(v => (v==null || (min!=null && v<min) || (max!=null && v>max)) ? NaN : v);
+  const pc = clean(p, 0, 2000);
+  const hrc = clean(hr, 40, 220);
+
+  const n = t.length;
+  const mid = Math.floor(n/2);
+
+  const mean = a => a.reduce((s,v)=>isFinite(v)?s+v:s,0) / a.filter(Number.isFinite).length;
+  const slice = (a,i,j)=>a.slice(i,j);
+
+  // Pw:HR drift
+  const pw_hr_early = mean(slice(pc,0,mid))/mean(slice(hrc,0,mid));
+  const pw_hr_late  = mean(slice(pc,mid,n))/mean(slice(hrc,mid,n));
+  const drift = ((pw_hr_late / pw_hr_early) - 1) * 100;
+
+  // rolling best 5-min early vs late (naive)
+  const win = 300; // 5min at 1s
+  const bestWindow = (arr, i0, i1) => {
+    let best = -Infinity;
+    for (let i=i0; i+win<=i1; i++) {
+      let s=0,c=0;
+      for (let k=0;k<win;k++){ const v=arr[i+k]; if(isFinite(v)){s+=v;c++;}}
+      if (c>0) best = Math.max(best, s/c);
+    }
+    return best;
+  };
+  const bestEarly = bestWindow(pc, 0, Math.max(win+1, mid));
+  const bestLate  = bestWindow(pc, Math.min(mid, n-win-1), n);
+  const delta5 = (isFinite(bestLate)&&isFinite(bestEarly)) ? (bestLate - bestEarly) : NaN;
+
+  // Power@anchor HR (150 bpm)
+  const anchor = 150;
+  const avgPowerAt = (hrArr, pArr, i0, i1, tol=2.5) => {
+    let s=0,c=0;
+    for (let i=i0;i<i1;i++){
+      const hv=hrArr[i], pv=pArr[i];
+      if (isFinite(hv)&&isFinite(pv) && Math.abs(hv-anchor)<=tol){ s+=pv; c++; }
+    }
+    return c>30 ? s/c : NaN;
+  };
+  const pEarlyAt = avgPowerAt(hrc, pc, 0, mid);
+  const pLateAt  = avgPowerAt(hrc, pc, mid, n);
+  const deltaPAt = (isFinite(pEarlyAt)&&isFinite(pLateAt)) ? (pLateAt - pEarlyAt) : NaN;
+
+  // Z2 share early→late (using rough HR proxy: 56–75% HRR would be better; for MVP, use absolute 120–150 bpm window)
+  const inZ2 = v => isFinite(v) && v>=120 && v<=150;
+  const share = (arr,i0,i1)=> {
+    const seg = arr.slice(i0,i1);
+    const c=seg.filter(Number.isFinite).length;
+    const z=seg.filter(inZ2).length;
+    return c? (100*z/c): NaN;
+  };
+  const z2e = share(hrc,0,mid), z2l = share(hrc,mid,n);
+
+  const lines = [
+    "Durability Analysis (v0.1)",
+    `• Pw:HR drift: ${isFinite(drift)?drift.toFixed(1):"NA"}%`,
+    `• 5-min power late vs early: ${isFinite(delta5)?(delta5>=0?"+":"") + Math.round(delta5):"NA"} W`,
+    `• Power@150 bpm: ${isFinite(deltaPAt)?(deltaPAt>=0?"+":"") + Math.round(deltaPAt):"NA"} W vs first half`,
+    `• Z2 share: ${isFinite(z2e)?z2e.toFixed(0):"NA"}% → ${isFinite(z2l)?z2l.toFixed(0):"NA"}%`,
+    "<!-- durability-post v0.1 -->"
+  ];
+  return lines.join("\n");
+}
+
+app.listen(PORT, async () => {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS athlete_tokens(
+      athlete_id BIGINT PRIMARY KEY,
+      access_token TEXT NOT NULL,
+      refresh_token TEXT NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL,
+      scope TEXT NOT NULL
+    );
+  `);
+  console.log(`Durability-Post listening on :${PORT}`);
+});
+
+
+One-time webhook subscription (admin)
+
+# ngrok http 3000   # or your HTTPS domain
+# When live, call Strava to create subscription:
+curl -X POST "https://www.strava.com/api/v3/push_subscriptions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "client_id":"'"$STRAVA_CLIENT_ID"'",
+    "client_secret":"'"$STRAVA_CLIENT_SECRET"'",
+    "callback_url":"https://YOUR_DOMAIN/webhook",
+    "verify_token":"'"$STRAVA_VERIFY_TOKEN"'"
+  }'
+
+
+(Your /webhook GET will receive the challenge; you must echo it as above.) 
+developers.strava.com
++1
+
+4) Data model (Postgres)
+athlete_tokens(
+  athlete_id bigint primary key,
+  access_token text not null,
+  refresh_token text not null,
+  expires_at timestamptz not null,
+  scope text not null
+)
+
+activity_cache(                -- optional for idempotency/backoff
+  athlete_id bigint,
+  activity_id bigint,
+  processed_at timestamptz,
+  result jsonb,
+  primary key (athlete_id, activity_id)
+)
+
+5) Algorithms (v0.1 → v1.1)
+
+v0.1 (above code):
+
+Clean streams (bounds, NaN handling).
+
+Split by elapsed time: halves (or terciles if <60 min).
+
+Metrics:
+
+Pw:HR drift: (Pw/HR late) / (Pw/HR early) - 1.
+
+Rolling best 5-min mean power in early vs late thirds.
+
+ΔPower at anchor HR=150 bpm (tolerance ±2.5 bpm).
+
+HR-proxy zones (rough, will refine).
+
+v1.1 planned upgrades:
+
+Use moving time windows; exclude pauses.
+
+Use NP and Pw:HR (decoupling) per TrainingPeaks style; optionally LOWESS fit watts~HR early/late and report Δ at athlete-specific Z2 HR.
+
+Per-athlete baseline table (8-week rolling) → classify “Better / Typical / Worse”.
+
+Trainer/Indoor flag handling; heat/altitude context.
+
+FTP & Z2 HR per-athlete prefs (UI).
+
+6) Error handling & rate-limit strategy
+
+On 429 or networking errors: exponential backoff, requeue after 5–10 min.
+
+Maintain activity_cache with a signature marker to keep updates idempotent (strip/replace your own block).
+
+Fetch only needed streams in one request (key_by_type=true). 
+developers.strava.com
+
+Respect default caps (200/15min; 2,000/day; 100/15min non-upload). Add a token bucket in worker. 
+developers.strava.com
+
+7) Security & compliance
+
+Store tokens encrypted (KMS or libsodium sealed boxes if you want to harden).
+
+On athlete webhook authorized=false, delete tokens. 
+developers.strava.com
+
+Show each athlete only their own results; no cross-user feeds. Comply with API terms (no model training). 
+The Verge
+
+8) DevOps
+
+Deploy: Fly.io/Render/Vercel serverless (Edge won’t keep sockets; use a tiny Node instance or serverful).
+
+Background worker: same instance (simple) or Redis-backed queue for retries.
+
+Observability: log 2xx/4xx/5xx counts by endpoint; alert on webhook 5xx spikes.
+
+9) Manual test script (no webhook)
+# After OAuth, pick an activity id you own:
+ACT_ID=1234567890
+TOKEN="Bearer $(node -e '/* query pg for access_token; print it */')"
+
+curl -s "https://www.strava.com/api/v3/activities/$ACT_ID/streams?keys=watts,heartrate,time&key_by_type=true" \
+  -H "Authorization: $TOKEN" | jq .
+
+# Update description (danger: overwrites your text if you choose to)
+curl -X PUT "https://www.strava.com/api/v3/activities/$ACT_ID" \
+  -H "Authorization: $TOKEN" -H "Content-Type: application/json" \
+  -d '{"description":"test\n\nDurability Analysis (v0.1)\n• Pw:HR drift: +6.2%\n<!-- durability-post v0.1 -->"}'
+
+
+Streams endpoint and update endpoint as documented. 
+developers.strava.com
++1
+
+10) Roadmap
+
+v0.2: Replace HR absolute bands with HRR-based zones; detect cadence drop + HR creep patterns.
+
+v0.3: Host a PNG chart (early vs late watts@HR), link it from the description.
+
+v0.4: Per-athlete web dashboard with weekly durability trend.
+
+v1.0: Coach view (explicit consent), multi-athlete filter, CSV export (still compliant with terms).
+
+11) Known risks / gotchas (and mitigations)
+
+Missing streams (no HR or no power) → post partial results with clear “skipped” notes.
+
+Virtual/ERG rides → flag and tone down decoupling verdicts.
+
+Short rides → require ≥40 min or fallback to terciles.
+
+Description collisions → always append, never clobber; strip your own marker block first.
+
+Rate limits with many users → add a worker queue + token bucket; coalesce duplicate events. 
+developers.strava.com
+
+Policy drift → keep an eye on API terms and community hub; avoid comments API assumptions (PATCH description is documented). 
+developers.strava.com
++1
+
+If you want this in FastAPI instead of Express, say the word and I’ll return a parallel Python skeleton.
