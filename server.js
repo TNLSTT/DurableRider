@@ -126,18 +126,15 @@ app.get('/oauth/callback', rateLimiter, async (req, res) => {
 });
 
 app.get('/webhook', (req, res) => {
-  const verifyToken = process.env.STRAVA_VERIFY_TOKEN;
-  if (!verifyToken) {
-    res.status(500).json({ error: 'Verify token not configured' });
-    return;
-  }
+  const { 'hub.mode': mode, 'hub.verify_token': token, 'hub.challenge': challenge } = req.query;
 
-  if (req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token'] === verifyToken) {
-    res.json({ 'hub.challenge': req.query['hub.challenge'] });
-    return;
+  if (mode === 'subscribe' && token === process.env.STRAVA_VERIFY_TOKEN) {
+    console.log('✅ Verified Strava webhook challenge');
+    res.status(200).json({ 'hub.challenge': challenge });
+  } else {
+    console.log('❌ Failed webhook verification');
+    res.sendStatus(403);
   }
-
-  res.status(403).json({ error: 'Invalid verification token' });
 });
 
 app.post('/webhook', rateLimiter, async (req, res) => {
