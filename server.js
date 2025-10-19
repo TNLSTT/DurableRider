@@ -1,9 +1,12 @@
 import 'dotenv/config';
 import express from 'express';
 import axios from 'axios';
-import { Pool } from 'pg';
 import qs from 'qs';
 import http from 'http';
+import { ensureSchema as ensureDbSchema, deleteAthleteToken } from './lib/db.js';
+import { initializeQueue, enqueueActivity, startQueueMonitor } from './lib/queue.js';
+import { processActivity } from './lib/activityProcessor.js';
+import { upsertAthleteTokenFromOAuth } from './lib/strava.js';
 
 // ===============================
 // Express + Core Setup
@@ -44,40 +47,13 @@ process.on('unhandledRejection', (reason) => {
 const port = Number.parseInt(process.env.PORT ?? '3000', 10);
 console.log(`🔧 ENV loaded: PORT=${port}, DB=${process.env.DATABASE_URL ?? '(none)'}`);
 
-// ===============================
-// Database
-// ===============================
-let pool = null;
-if (process.env.DATABASE_URL) {
-  try {
-    pool = new Pool({
-      connectionString: process.env.DATABASE_URL,
-      ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : false,
-    });
-    console.log('🧠 Postgres pool created');
-  } catch (err) {
-    console.error('❌ Failed to initialize database pool:', err);
-  }
-} else {
-  console.warn('⚠️ DATABASE_URL not set. Database features disabled.');
+const dbConfigured = Boolean(process.env.DATABASE_URL);
+if (!dbConfigured) {
+  console.warn('⚠️ DATABASE_URL not set. Database-backed durability features disabled.');
 }
 
-async function ensureSchema() {
-  if (!pool) return;
-  console.log('🧱 Ensuring DB schema...');
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS athlete_tokens (
-      athlete_id BIGINT PRIMARY KEY,
-      access_token TEXT NOT NULL,
-      refresh_token TEXT NOT NULL,
-      expires_at TIMESTAMPTZ NOT NULL,
-      scope TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-  console.log('✅ DB schema ensured');
-}
+initializeQueue(processActivity);
+startQueueMonitor();
 
 // ===============================
 // Routes
@@ -146,11 +122,6 @@ app.get('/oauth/callback', async (req, res) => {
     });
     console.log('✅ OAuth token exchange succeeded');
 
-    if (!pool) {
-      res.status(200).json({ message: 'DB not configured', data: tokenResponse.data });
-      return;
-    }
-
     const {
       access_token: accessToken,
       refresh_token: refreshToken,
@@ -159,20 +130,26 @@ app.get('/oauth/callback', async (req, res) => {
       scope,
     } = tokenResponse.data;
 
-    await pool.query(
-      `INSERT INTO athlete_tokens (athlete_id, access_token, refresh_token, expires_at, scope, updated_at)
-       VALUES ($1,$2,$3,to_timestamp($4),$5,NOW())
-       ON CONFLICT (athlete_id) DO UPDATE SET
-         access_token=EXCLUDED.access_token,
-         refresh_token=EXCLUDED.refresh_token,
-         expires_at=EXCLUDED.expires_at,
-         scope=EXCLUDED.scope,
-         updated_at=NOW()`,
-      [athlete.id, accessToken, refreshToken, expiresAt, Array.isArray(scope) ? scope.join(',') : scope ?? '']
-    );
+    if (!dbConfigured) {
+      console.warn('⚠️ OAuth succeeded but DATABASE_URL is not configured. Tokens not persisted.');
+      res.status(200).json({ message: 'OAuth success (tokens not persisted)', athlete });
+      return;
+    }
 
-    console.log(`💾 Stored tokens for athlete ${athlete.id}`);
-    res.json({ message: 'OAuth success', athlete });
+    try {
+      await upsertAthleteTokenFromOAuth({
+        athleteId: athlete.id,
+        accessToken,
+        refreshToken,
+        expiresAt,
+        scope: Array.isArray(scope) ? scope.join(',') : scope ?? '',
+      });
+      console.log(`💾 Stored tokens for athlete ${athlete.id}`);
+      res.json({ message: 'OAuth success', athlete });
+    } catch (dbError) {
+      console.error('❌ Failed to persist OAuth tokens:', dbError);
+      res.status(500).json({ error: 'Failed to persist tokens. Please try again later.' });
+    }
   } catch (err) {
     console.error('❌ /oauth/callback failed:', err);
     res.status(500).json({ error: err.message });
@@ -197,37 +174,24 @@ app.post('/webhook', async (req, res) => {
   res.status(200).send('EVENT_RECEIVED');
 
   try {
-    if (req.body.aspect_type === 'create') {
-      console.log(`Fetching details for ${req.body.object_id}...`);
-      const tokenRes = await pool.query(
-        'SELECT access_token FROM athlete_tokens WHERE athlete_id=$1',
-        [req.body.owner_id]
-      );
-      const token = tokenRes.rows[0]?.access_token;
-      if (token) {
-        const activityUrl = `https://www.strava.com/api/v3/activities/${req.body.object_id}`;
-        const headers = { Authorization: `Bearer ${token}` };
+    const event = req.body;
 
-        // 1️⃣ Fetch activity details
-        const { data: activity } = await axios.get(activityUrl, { headers });
-        console.log('🏁 Activity:', activity.name, activity.distance);
-
-        // 2️⃣ Create a new description
-        const newDescription = `[DurableRider] ${activity.name} — ${(activity.distance / 1000).toFixed(
-          1
-        )} km\nAuto-updated by DurableRider.`;
-
-        // 3️⃣ Update activity description
-        const updateRes = await axios.put(
-          activityUrl,
-          { description: newDescription },
-          { headers }
-        );
-
-        console.log('📝 Updated activity description →', updateRes.data.description);
-      } else {
-        console.warn(`⚠️ No access token found for athlete ${req.body.owner_id}`);
+    if (event.object_type === 'activity' && (event.aspect_type === 'create' || event.aspect_type === 'update')) {
+      if (!dbConfigured) {
+        console.warn('⚠️ Received activity event but DATABASE_URL is not configured. Skipping durability processing.');
+        return;
       }
+
+      await enqueueActivity({ athleteId: event.owner_id, activityId: event.object_id });
+      console.log(`📬 Activity ${event.object_id} for athlete ${event.owner_id} enqueued for durability analysis.`);
+    }
+
+    if (event.object_type === 'athlete' && event.aspect_type === 'update' && event.updates?.authorized === 'false') {
+      if (!dbConfigured) {
+        return;
+      }
+      await deleteAthleteToken(event.owner_id);
+      console.log(`🧹 Revoked tokens for athlete ${event.owner_id} after deauthorization.`);
     }
   } catch (err) {
     console.error('❌ Error processing webhook event:', err);
@@ -253,10 +217,10 @@ async function start() {
   });
 
   // Run DB schema creation async (non-blocking)
-  if (pool) {
-    ensureSchema().catch((err) => console.error('❌ Schema init failed:', err));
+  if (dbConfigured) {
+    ensureDbSchema().catch((err) => console.error('❌ Schema init failed:', err));
   }
 }
 
 start();
-export { app, pool };
+export { app };
