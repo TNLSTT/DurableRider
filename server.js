@@ -1,12 +1,14 @@
 import 'dotenv/config';
 import express from 'express';
-import axios from 'axios';
-import qs from 'qs';
 import http from 'http';
 import { ensureSchema as ensureDbSchema, deleteAthleteToken } from './lib/db.js';
 import { initializeQueue, enqueueActivity, startQueueMonitor } from './lib/queue.js';
 import { processActivity } from './lib/activityProcessor.js';
-import { upsertAthleteTokenFromOAuth } from './lib/strava.js';
+import {
+  buildAuthorizationUrl,
+  exchangeOAuthToken,
+  upsertAthleteTokenFromOAuth,
+} from './lib/strava.js';
 
 // ===============================
 // Express + Core Setup
@@ -71,27 +73,11 @@ app.get('/health', (req, res) => {
 app.get('/oauth/start', (req, res) => {
   console.log('⚙️  /oauth/start triggered');
   try {
-    const clientId = process.env.STRAVA_CLIENT_ID;
-    const redirectUri = process.env.OAUTH_REDIRECT_URI;
-    if (!clientId || !redirectUri) {
-      res.status(500).json({ error: 'Strava OAuth not configured' });
-      return;
-    }
-
-    const scope = 'activity:read_all,activity:write';
-    const query = qs.stringify(
-      {
-        client_id: clientId,
-        response_type: 'code',
-        redirect_uri: redirectUri,
-        approval_prompt: 'auto',
-        scope,
-        state: req.query.state,
-      },
-      { arrayFormat: 'repeat' }
-    );
-
-    const redirect = `https://www.strava.com/oauth/authorize?${query}`;
+    const redirect = buildAuthorizationUrl({
+      redirectUri: process.env.OAUTH_REDIRECT_URI,
+      state: req.query.state,
+      scope: req.query.scope,
+    });
     console.log(`🔗 Redirecting to: ${redirect}`);
     res.redirect(redirect);
   } catch (err) {
@@ -114,38 +100,19 @@ app.get('/oauth/callback', async (req, res) => {
   }
 
   try {
-    const tokenResponse = await axios.post('https://www.strava.com/oauth/token', {
-      client_id: process.env.STRAVA_CLIENT_ID,
-      client_secret: process.env.STRAVA_CLIENT_SECRET,
-      code,
-      grant_type: 'authorization_code',
-    });
+    const oauthData = await exchangeOAuthToken(code);
     console.log('✅ OAuth token exchange succeeded');
-
-    const {
-      access_token: accessToken,
-      refresh_token: refreshToken,
-      expires_at: expiresAt,
-      athlete,
-      scope,
-    } = tokenResponse.data;
 
     if (!dbConfigured) {
       console.warn('⚠️ OAuth succeeded but DATABASE_URL is not configured. Tokens not persisted.');
-      res.status(200).json({ message: 'OAuth success (tokens not persisted)', athlete });
+      res.status(200).json({ message: 'OAuth success (tokens not persisted)', athlete: oauthData.athlete });
       return;
     }
 
     try {
-      await upsertAthleteTokenFromOAuth({
-        athleteId: athlete.id,
-        accessToken,
-        refreshToken,
-        expiresAt,
-        scope: Array.isArray(scope) ? scope.join(',') : scope ?? '',
-      });
-      console.log(`💾 Stored tokens for athlete ${athlete.id}`);
-      res.json({ message: 'OAuth success', athlete });
+      await upsertAthleteTokenFromOAuth(oauthData);
+      console.log(`💾 Stored tokens for athlete ${oauthData.athleteId}`);
+      res.json({ message: 'OAuth success', athlete: oauthData.athlete });
     } catch (dbError) {
       console.error('❌ Failed to persist OAuth tokens:', dbError);
       res.status(500).json({ error: 'Failed to persist tokens. Please try again later.' });
