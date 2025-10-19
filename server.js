@@ -1,92 +1,155 @@
 import 'dotenv/config';
 import express from 'express';
 import axios from 'axios';
+import { Pool } from 'pg';
 import qs from 'qs';
+import http from 'http';
 
-import { ensureSchema, deleteAthleteToken, getAthleteToken } from './lib/db.js';
-import { upsertAthleteTokenFromOAuth } from './lib/strava.js';
-import { processActivity } from './lib/activityProcessor.js';
-import { initializeQueue, enqueueActivity, startQueueMonitor } from './lib/queue.js';
-import { createTokenBucketMiddleware } from './lib/rateLimiter.js';
-
+// ===============================
+// Express + Core Setup
+// ===============================
 const app = express();
-app.use(express.json());
+console.log('✅ Express initialized');
 
+app.use(express.json({ limit: '1mb' }));
+
+// Request logger — captures every request in real-time
 app.use((req, res, next) => {
   const start = Date.now();
+  console.log(`➡️  [${req.method}] ${req.url} — Headers:`, req.headers);
+
   res.on('finish', () => {
-    const duration = Date.now() - start;
-    console.log(`${req.method} ${req.originalUrl} -> ${res.statusCode} (${duration}ms)`);
+    const ms = Date.now() - start;
+    console.log(`⬅️  [${req.method}] ${req.url} -> ${res.statusCode} (${ms}ms)`);
   });
+
   next();
 });
 
-const port = Number.parseInt(process.env.PORT ?? '3000', 10);
+// Capture low-level socket connections
+app.on('connection', (socket) => {
+  console.log(`🔌 New connection from ${socket.remoteAddress}`);
+});
 
-if (process.env.WEBHOOK_PUBLIC_URL && !process.env.WEBHOOK_PUBLIC_URL.startsWith('https://')) {
-  console.warn('WEBHOOK_PUBLIC_URL is not HTTPS. Configure HTTPS (e.g., via ngrok) for Strava webhooks.');
+process.on('uncaughtException', (err) => {
+  console.error('💥 Uncaught Exception:', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('💥 Unhandled Rejection:', reason);
+});
+
+// ===============================
+// Environment
+// ===============================
+const port = Number.parseInt(process.env.PORT ?? '3000', 10);
+console.log(`🔧 ENV loaded: PORT=${port}, DB=${process.env.DATABASE_URL ?? '(none)'}`);
+
+// ===============================
+// Database
+// ===============================
+let pool = null;
+if (process.env.DATABASE_URL) {
+  try {
+    pool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : false,
+    });
+    console.log('🧠 Postgres pool created');
+  } catch (err) {
+    console.error('❌ Failed to initialize database pool:', err);
+  }
+} else {
+  console.warn('⚠️ DATABASE_URL not set. Database features disabled.');
 }
 
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok' });
-});
+async function ensureSchema() {
+  if (!pool) return;
+  console.log('🧱 Ensuring DB schema...');
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS athlete_tokens (
+      athlete_id BIGINT PRIMARY KEY,
+      access_token TEXT NOT NULL,
+      refresh_token TEXT NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL,
+      scope TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+  console.log('✅ DB schema ensured');
+}
 
-const rateLimiter = createTokenBucketMiddleware();
-
-app.get('/oauth/start', rateLimiter, (req, res) => {
-  const clientId = process.env.STRAVA_CLIENT_ID;
-  const redirectUri = process.env.OAUTH_REDIRECT_URI;
-  if (!clientId || !redirectUri) {
-    res.status(500).json({ error: 'Strava OAuth is not configured' });
-    return;
+// ===============================
+// Routes
+// ===============================
+app.get('/health', (req, res) => {
+  console.log('🩺 /health route triggered');
+  try {
+    res.status(200).json({ status: 'ok', time: new Date().toISOString() });
+  } catch (err) {
+    console.error('❌ Health route error:', err);
+    res.status(500).json({ error: err.message });
   }
-
-  const scope = 'activity:read_all,activity:write';
-  const query = qs.stringify(
-    {
-      client_id: clientId,
-      response_type: 'code',
-      redirect_uri: redirectUri,
-      approval_prompt: 'auto',
-      scope,
-      state: req.query.state,
-    },
-    {
-      arrayFormat: 'repeat',
-      filter: (_prefix, value) => (value === undefined ? undefined : value),
-    },
-  );
-
-  res.redirect(`https://www.strava.com/oauth/authorize?${query}`);
 });
 
-app.get('/oauth/callback', rateLimiter, async (req, res) => {
+app.get('/oauth/start', (req, res) => {
+  console.log('⚙️  /oauth/start triggered');
+  try {
+    const clientId = process.env.STRAVA_CLIENT_ID;
+    const redirectUri = process.env.OAUTH_REDIRECT_URI;
+    if (!clientId || !redirectUri) {
+      res.status(500).json({ error: 'Strava OAuth not configured' });
+      return;
+    }
+
+    const scope = 'activity:read_all,activity:write';
+    const query = qs.stringify(
+      {
+        client_id: clientId,
+        response_type: 'code',
+        redirect_uri: redirectUri,
+        approval_prompt: 'auto',
+        scope,
+        state: req.query.state,
+      },
+      { arrayFormat: 'repeat' }
+    );
+
+    const redirect = `https://www.strava.com/oauth/authorize?${query}`;
+    console.log(`🔗 Redirecting to: ${redirect}`);
+    res.redirect(redirect);
+  } catch (err) {
+    console.error('❌ /oauth/start failed:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/oauth/callback', async (req, res) => {
+  console.log('🔁 /oauth/callback triggered');
   const { code, error } = req.query;
   if (error) {
-    res.status(400).json({ error: String(error) });
+    console.error('⚠️  OAuth callback error param:', error);
+    res.status(400).json({ error });
     return;
   }
-
   if (!code) {
     res.status(400).json({ error: 'Missing authorization code' });
     return;
   }
 
-  const clientId = process.env.STRAVA_CLIENT_ID;
-  const clientSecret = process.env.STRAVA_CLIENT_SECRET;
-  const redirectUri = process.env.OAUTH_REDIRECT_URI;
-  if (!clientId || !clientSecret || !redirectUri) {
-    res.status(500).json({ error: 'Strava OAuth is not configured' });
-    return;
-  }
-
   try {
     const tokenResponse = await axios.post('https://www.strava.com/oauth/token', {
-      client_id: clientId,
-      client_secret: clientSecret,
+      client_id: process.env.STRAVA_CLIENT_ID,
+      client_secret: process.env.STRAVA_CLIENT_SECRET,
       code,
       grant_type: 'authorization_code',
     });
+    console.log('✅ OAuth token exchange succeeded');
+
+    if (!pool) {
+      res.status(200).json({ message: 'DB not configured', data: tokenResponse.data });
+      return;
+    }
 
     const {
       access_token: accessToken,
@@ -96,145 +159,89 @@ app.get('/oauth/callback', rateLimiter, async (req, res) => {
       scope,
     } = tokenResponse.data;
 
-    if (!athlete || !athlete.id) {
-      res.status(500).json({ error: 'Missing athlete information in Strava response' });
-      return;
-    }
+    await pool.query(
+      `INSERT INTO athlete_tokens (athlete_id, access_token, refresh_token, expires_at, scope, updated_at)
+       VALUES ($1,$2,$3,to_timestamp($4),$5,NOW())
+       ON CONFLICT (athlete_id) DO UPDATE SET
+         access_token=EXCLUDED.access_token,
+         refresh_token=EXCLUDED.refresh_token,
+         expires_at=EXCLUDED.expires_at,
+         scope=EXCLUDED.scope,
+         updated_at=NOW()`,
+      [athlete.id, accessToken, refreshToken, expiresAt, Array.isArray(scope) ? scope.join(',') : scope ?? '']
+    );
 
-    await upsertAthleteTokenFromOAuth({
-      athleteId: athlete.id,
-      accessToken,
-      refreshToken,
-      expiresAt,
-      scope: Array.isArray(scope) ? scope.join(',') : scope ?? '',
-    });
-
-    res.json({
-      message: 'OAuth tokens stored successfully',
-      athlete: { id: athlete.id, firstname: athlete.firstname, lastname: athlete.lastname },
-    });
+    console.log(`💾 Stored tokens for athlete ${athlete.id}`);
+    res.json({ message: 'OAuth success', athlete });
   } catch (err) {
-    console.error('Failed to handle OAuth callback', err);
-    if (axios.isAxiosError?.(err)) {
-      res.status(err.response?.status ?? 500).json({
-        error: err.response?.data ?? err.message,
-      });
-    } else {
-      res.status(500).json({ error: err.message });
-    }
+    console.error('❌ /oauth/callback failed:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
 app.get('/webhook', (req, res) => {
+  console.log('🌐 /webhook GET verification hit', req.query);
   const { 'hub.mode': mode, 'hub.verify_token': token, 'hub.challenge': challenge } = req.query;
-
   if (mode === 'subscribe' && token === process.env.STRAVA_VERIFY_TOKEN) {
-    console.log('✅ Verified Strava webhook challenge');
+    console.log('✅ Webhook verified');
     res.status(200).json({ 'hub.challenge': challenge });
   } else {
-    console.log('❌ Failed webhook verification');
+    console.log('❌ Webhook verification failed');
     res.sendStatus(403);
   }
 });
 
-app.post('/webhook', rateLimiter, (req, res) => {
+// Strava webhook event receiver (POST)
+app.post('/webhook', async (req, res) => {
   console.log('📡 Received webhook event:', JSON.stringify(req.body, null, 2));
   res.status(200).send('EVENT_RECEIVED');
 
-  const body = req.body;
-  if (!body) {
-    return;
-  }
-
-  const { aspect_type: aspectType, object_type: objectType, object_id: activityId, owner_id: athleteId, updates } = body;
-
-  if (aspectType === 'create' && activityId && athleteId) {
-    console.log(`Fetching details for ${activityId}...`);
-    void (async () => {
-      try {
-        const tokenRecord = await getAthleteToken(Number(athleteId));
-        const token = tokenRecord?.accessToken;
-        if (token) {
-          const activity = await axios.get(`https://www.strava.com/api/v3/activities/${activityId}`, {
-            headers: { Authorization: `Bearer ${token}` },
-          });
-          console.log('🏁 Activity:', activity.data.name, activity.data.distance);
-        } else {
-          console.warn(`No access token found for athlete ${athleteId}`);
-        }
-      } catch (error) {
-        console.error(`Failed to fetch activity ${activityId} details`, error);
+  try {
+    if (req.body.aspect_type === 'create') {
+      console.log(`Fetching details for ${req.body.object_id}...`);
+      const tokenRes = await pool.query(
+        'SELECT access_token FROM athlete_tokens WHERE athlete_id=$1',
+        [req.body.owner_id]
+      );
+      const token = tokenRes.rows[0]?.access_token;
+      if (token) {
+        const activity = await axios.get(
+          `https://www.strava.com/api/v3/activities/${req.body.object_id}`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        console.log('🏁 Activity:', activity.data.name, activity.data.distance);
+      } else {
+        console.warn(`⚠️ No access token found for athlete ${req.body.owner_id}`);
       }
-    })();
-  }
-
-  if (updates?.authorized === 'false' && athleteId) {
-    console.log(`Athlete ${athleteId} deauthorized. Deleting tokens.`);
-    void deleteAthleteToken(athleteId);
-    return;
-  }
-
-  if (objectType === 'activity' && (aspectType === 'create' || aspectType === 'update')) {
-    if (!athleteId || !activityId) {
-      console.warn('Webhook missing athlete or activity id', body);
-      return;
     }
-
-    void enqueueActivity({ athleteId: Number(athleteId), activityId: Number(activityId) }).catch((error) => {
-      console.error('Failed to enqueue activity', error);
-    });
+  } catch (err) {
+    console.error('❌ Error processing webhook event:', err);
   }
 });
 
-app.use((err, req, res, _next) => {
-  console.error('Request error', err);
-  if (req.path === '/webhook') {
-    console.error('ALERT: Webhook handler failed', err.message);
-  }
-  res.status(err.status ?? 500).json({ error: err.message ?? 'Internal server error' });
-});
 
-app.get('/dashboard/:athleteId', async (req, res) => {
-  const { athleteId } = req.params;
-  try {
-    const sinceDate = new Date(Date.now() - 56 * 24 * 60 * 60 * 1000);
-    const { loadBaselineMetrics } = await import('./lib/db.js');
-    const metrics = await loadBaselineMetrics(Number(athleteId), sinceDate);
-    res.send(`<!DOCTYPE html>
-<html><head><title>Durability Dashboard</title></head>
-<body>
-<h1>Durability history for athlete ${athleteId}</h1>
-<ul>
-${metrics
-  .map(
-    (row) => `<li>${new Date(row.activity_date).toISOString()}: Pw:HR drift ${row.pw_hr_drift ?? 'n/a'}%, Rolling Δ ${row.rolling5_diff ?? 'n/a'}W</li>`,
-  )
-  .join('')}
-</ul>
-</body></html>`);
-  } catch (error) {
-    console.error('Failed to load dashboard', error);
-    res.status(500).json({ error: 'Failed to load dashboard' });
-  }
-});
-
+// ===============================
+// Startup
+// ===============================
 async function start() {
-  try {
-    if (!process.env.TOKEN_ENCRYPTION_KEY) {
-      throw new Error('TOKEN_ENCRYPTION_KEY must be configured for encrypted token storage.');
-    }
-    await ensureSchema();
-    initializeQueue(processActivity);
-    startQueueMonitor();
-    app.listen(port, () => {
-      console.log(`DurableRider server listening on port ${port}`);
-    });
-  } catch (error) {
-    console.error('Failed to initialize application', error);
-    process.exit(1);
+  console.log('🚦 Starting DurableRider...');
+
+  const server = http.createServer(app);
+  server.on('error', (err) => console.error('💥 HTTP server error:', err));
+  server.on('connection', (socket) => {
+    console.log(`🧩 New TCP socket from ${socket.remoteAddress}`);
+    socket.on('error', (err) => console.error('⚠️ Socket error:', err));
+  });
+
+  server.listen(port, '0.0.0.0', () => {
+    console.log(`🚀 Server live at http://127.0.0.1:${port}`);
+  });
+
+  // Run DB schema creation async (non-blocking)
+  if (pool) {
+    ensureSchema().catch((err) => console.error('❌ Schema init failed:', err));
   }
 }
 
 start();
-
-export { app };
+export { app, pool };
