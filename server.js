@@ -3,7 +3,7 @@ import express from 'express';
 import axios from 'axios';
 import qs from 'qs';
 
-import { ensureSchema, deleteAthleteToken } from './lib/db.js';
+import { ensureSchema, deleteAthleteToken, getAthleteToken } from './lib/db.js';
 import { upsertAthleteTokenFromOAuth } from './lib/strava.js';
 import { processActivity } from './lib/activityProcessor.js';
 import { initializeQueue, enqueueActivity, startQueueMonitor } from './lib/queue.js';
@@ -147,6 +147,26 @@ app.post('/webhook', rateLimiter, (req, res) => {
   }
 
   const { aspect_type: aspectType, object_type: objectType, object_id: activityId, owner_id: athleteId, updates } = body;
+
+  if (aspectType === 'create' && activityId && athleteId) {
+    console.log(`Fetching details for ${activityId}...`);
+    void (async () => {
+      try {
+        const tokenRecord = await getAthleteToken(Number(athleteId));
+        const token = tokenRecord?.accessToken;
+        if (token) {
+          const activity = await axios.get(`https://www.strava.com/api/v3/activities/${activityId}`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          console.log('🏁 Activity:', activity.data.name, activity.data.distance);
+        } else {
+          console.warn(`No access token found for athlete ${athleteId}`);
+        }
+      } catch (error) {
+        console.error(`Failed to fetch activity ${activityId} details`, error);
+      }
+    })();
+  }
 
   if (updates?.authorized === 'false' && athleteId) {
     console.log(`Athlete ${athleteId} deauthorized. Deleting tokens.`);
