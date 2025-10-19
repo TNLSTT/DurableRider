@@ -205,11 +205,26 @@ app.post('/webhook', async (req, res) => {
       );
       const token = tokenRes.rows[0]?.access_token;
       if (token) {
-        const activity = await axios.get(
-          `https://www.strava.com/api/v3/activities/${req.body.object_id}`,
-          { headers: { Authorization: `Bearer ${token}` } }
+        const activityUrl = `https://www.strava.com/api/v3/activities/${req.body.object_id}`;
+        const headers = { Authorization: `Bearer ${token}` };
+
+        // 1️⃣ Fetch activity details
+        const { data: activity } = await axios.get(activityUrl, { headers });
+        console.log('🏁 Activity:', activity.name, activity.distance);
+
+        // 2️⃣ Create a new description
+        const newDescription = `[DurableRider] ${activity.name} — ${(activity.distance / 1000).toFixed(
+          1
+        )} km\nAuto-updated by DurableRider.`;
+
+        // 3️⃣ Update activity description
+        const updateRes = await axios.put(
+          activityUrl,
+          { description: newDescription },
+          { headers }
         );
-        console.log('🏁 Activity:', activity.data.name, activity.data.distance);
+
+        console.log('📝 Updated activity description →', updateRes.data.description);
       } else {
         console.warn(`⚠️ No access token found for athlete ${req.body.owner_id}`);
       }
