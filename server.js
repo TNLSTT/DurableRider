@@ -1,47 +1,39 @@
 import 'dotenv/config';
 import express from 'express';
 import axios from 'axios';
-import { Pool } from 'pg';
 import qs from 'qs';
+
+import { ensureSchema, deleteAthleteToken } from './lib/db.js';
+import { upsertAthleteTokenFromOAuth } from './lib/strava.js';
+import { processActivity } from './lib/activityProcessor.js';
+import { initializeQueue, enqueueActivity, startQueueMonitor } from './lib/queue.js';
+import { createTokenBucketMiddleware } from './lib/rateLimiter.js';
 
 const app = express();
 app.use(express.json());
 
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    console.log(`${req.method} ${req.originalUrl} -> ${res.statusCode} (${duration}ms)`);
+  });
+  next();
+});
+
 const port = Number.parseInt(process.env.PORT ?? '3000', 10);
 
-let pool = null;
-if (process.env.DATABASE_URL) {
-  pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : false,
-  });
-} else {
-  console.warn('DATABASE_URL not set. Database-backed features are disabled.');
-}
-
-async function ensureSchema() {
-  if (!pool) {
-    return;
-  }
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS athlete_tokens (
-      athlete_id BIGINT PRIMARY KEY,
-      access_token TEXT NOT NULL,
-      refresh_token TEXT NOT NULL,
-      expires_at TIMESTAMPTZ NOT NULL,
-      scope TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
+if (process.env.WEBHOOK_PUBLIC_URL && !process.env.WEBHOOK_PUBLIC_URL.startsWith('https://')) {
+  console.warn('WEBHOOK_PUBLIC_URL is not HTTPS. Configure HTTPS (e.g., via ngrok) for Strava webhooks.');
 }
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
 });
 
-app.get('/oauth/start', (req, res) => {
+const rateLimiter = createTokenBucketMiddleware();
+
+app.get('/oauth/start', rateLimiter, (req, res) => {
   const clientId = process.env.STRAVA_CLIENT_ID;
   const redirectUri = process.env.OAUTH_REDIRECT_URI;
   if (!clientId || !redirectUri) {
@@ -68,7 +60,7 @@ app.get('/oauth/start', (req, res) => {
   res.redirect(`https://www.strava.com/oauth/authorize?${query}`);
 });
 
-app.get('/oauth/callback', async (req, res) => {
+app.get('/oauth/callback', rateLimiter, async (req, res) => {
   const { code, error } = req.query;
   if (error) {
     res.status(400).json({ error: String(error) });
@@ -96,14 +88,6 @@ app.get('/oauth/callback', async (req, res) => {
       grant_type: 'authorization_code',
     });
 
-    if (!pool) {
-      res.status(200).json({
-        message: 'OAuth callback handled, but database is not configured. Tokens were not persisted.',
-        data: tokenResponse.data,
-      });
-      return;
-    }
-
     const {
       access_token: accessToken,
       refresh_token: refreshToken,
@@ -117,18 +101,13 @@ app.get('/oauth/callback', async (req, res) => {
       return;
     }
 
-    await pool.query(
-      `INSERT INTO athlete_tokens (athlete_id, access_token, refresh_token, expires_at, scope, updated_at)
-       VALUES ($1, $2, $3, to_timestamp($4), $5, NOW())
-       ON CONFLICT (athlete_id)
-       DO UPDATE SET
-         access_token = EXCLUDED.access_token,
-         refresh_token = EXCLUDED.refresh_token,
-         expires_at = EXCLUDED.expires_at,
-         scope = EXCLUDED.scope,
-         updated_at = NOW()`,
-      [athlete.id, accessToken, refreshToken, expiresAt, Array.isArray(scope) ? scope.join(',') : scope ?? ''],
-    );
+    await upsertAthleteTokenFromOAuth({
+      athleteId: athlete.id,
+      accessToken,
+      refreshToken,
+      expiresAt,
+      scope: Array.isArray(scope) ? scope.join(',') : scope ?? '',
+    });
 
     res.json({
       message: 'OAuth tokens stored successfully',
@@ -146,9 +125,91 @@ app.get('/oauth/callback', async (req, res) => {
   }
 });
 
+app.get('/webhook', (req, res) => {
+  const verifyToken = process.env.STRAVA_VERIFY_TOKEN;
+  if (!verifyToken) {
+    res.status(500).json({ error: 'Verify token not configured' });
+    return;
+  }
+
+  if (req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token'] === verifyToken) {
+    res.json({ 'hub.challenge': req.query['hub.challenge'] });
+    return;
+  }
+
+  res.status(403).json({ error: 'Invalid verification token' });
+});
+
+app.post('/webhook', rateLimiter, async (req, res) => {
+  const body = req.body;
+  res.status(202).json({ received: true });
+
+  if (!body) {
+    return;
+  }
+
+  const { aspect_type: aspectType, object_type: objectType, object_id: activityId, owner_id: athleteId, updates } = body;
+
+  if (updates?.authorized === 'false' && athleteId) {
+    console.log(`Athlete ${athleteId} deauthorized. Deleting tokens.`);
+    await deleteAthleteToken(athleteId);
+    return;
+  }
+
+  if (objectType === 'activity' && (aspectType === 'create' || aspectType === 'update')) {
+    if (!athleteId || !activityId) {
+      console.warn('Webhook missing athlete or activity id', body);
+      return;
+    }
+
+    try {
+      await enqueueActivity({ athleteId: Number(athleteId), activityId: Number(activityId) });
+    } catch (error) {
+      console.error('Failed to enqueue activity', error);
+    }
+  }
+});
+
+app.use((err, req, res, _next) => {
+  console.error('Request error', err);
+  if (req.path === '/webhook') {
+    console.error('ALERT: Webhook handler failed', err.message);
+  }
+  res.status(err.status ?? 500).json({ error: err.message ?? 'Internal server error' });
+});
+
+app.get('/dashboard/:athleteId', async (req, res) => {
+  const { athleteId } = req.params;
+  try {
+    const sinceDate = new Date(Date.now() - 56 * 24 * 60 * 60 * 1000);
+    const { loadBaselineMetrics } = await import('./lib/db.js');
+    const metrics = await loadBaselineMetrics(Number(athleteId), sinceDate);
+    res.send(`<!DOCTYPE html>
+<html><head><title>Durability Dashboard</title></head>
+<body>
+<h1>Durability history for athlete ${athleteId}</h1>
+<ul>
+${metrics
+  .map(
+    (row) => `<li>${new Date(row.activity_date).toISOString()}: Pw:HR drift ${row.pw_hr_drift ?? 'n/a'}%, Rolling Δ ${row.rolling5_diff ?? 'n/a'}W</li>`,
+  )
+  .join('')}
+</ul>
+</body></html>`);
+  } catch (error) {
+    console.error('Failed to load dashboard', error);
+    res.status(500).json({ error: 'Failed to load dashboard' });
+  }
+});
+
 async function start() {
   try {
+    if (!process.env.TOKEN_ENCRYPTION_KEY) {
+      throw new Error('TOKEN_ENCRYPTION_KEY must be configured for encrypted token storage.');
+    }
     await ensureSchema();
+    initializeQueue(processActivity);
+    startQueueMonitor();
     app.listen(port, () => {
       console.log(`DurableRider server listening on port ${port}`);
     });
@@ -160,4 +221,4 @@ async function start() {
 
 start();
 
-export { app, pool };
+export { app };
