@@ -8,8 +8,9 @@
 - Connect to Postgres via `pg` Pool and auto-create the `athlete_tokens` table if missing. [DONE]
 
 ## 2. OAuth Integration
-- Implement `/oauth/start` endpoint that redirects user to Strava’s authorization URL with scopes `activity:read_all,activity:write`.  
-- Implement `/oauth/callback` endpoint that exchanges the `code` for tokens and saves athlete info in Postgres.  
+- Implement `/oauth/start` endpoint that redirects user to Strava’s authorization URL with scopes `activity:read_all,activity:write`. [DONE]
+  - Resolution: Added Express route building the Strava authorize URL from environment configuration and redirecting requests.
+- Implement `/oauth/callback` endpoint that exchanges the `code` for tokens and saves athlete info in Postgres.
 - Write helper `upsertAthleteToken()` to insert or update tokens with expiry handling.  
 - Write helper `getValidToken()` that refreshes the Strava token automatically if expired.  
 
