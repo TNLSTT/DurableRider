@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
+import axios from 'axios';
 import { Pool } from 'pg';
 import qs from 'qs';
 
@@ -65,6 +66,84 @@ app.get('/oauth/start', (req, res) => {
   );
 
   res.redirect(`https://www.strava.com/oauth/authorize?${query}`);
+});
+
+app.get('/oauth/callback', async (req, res) => {
+  const { code, error } = req.query;
+  if (error) {
+    res.status(400).json({ error: String(error) });
+    return;
+  }
+
+  if (!code) {
+    res.status(400).json({ error: 'Missing authorization code' });
+    return;
+  }
+
+  const clientId = process.env.STRAVA_CLIENT_ID;
+  const clientSecret = process.env.STRAVA_CLIENT_SECRET;
+  const redirectUri = process.env.OAUTH_REDIRECT_URI;
+  if (!clientId || !clientSecret || !redirectUri) {
+    res.status(500).json({ error: 'Strava OAuth is not configured' });
+    return;
+  }
+
+  try {
+    const tokenResponse = await axios.post('https://www.strava.com/oauth/token', {
+      client_id: clientId,
+      client_secret: clientSecret,
+      code,
+      grant_type: 'authorization_code',
+    });
+
+    if (!pool) {
+      res.status(200).json({
+        message: 'OAuth callback handled, but database is not configured. Tokens were not persisted.',
+        data: tokenResponse.data,
+      });
+      return;
+    }
+
+    const {
+      access_token: accessToken,
+      refresh_token: refreshToken,
+      expires_at: expiresAt,
+      athlete,
+      scope,
+    } = tokenResponse.data;
+
+    if (!athlete || !athlete.id) {
+      res.status(500).json({ error: 'Missing athlete information in Strava response' });
+      return;
+    }
+
+    await pool.query(
+      `INSERT INTO athlete_tokens (athlete_id, access_token, refresh_token, expires_at, scope, updated_at)
+       VALUES ($1, $2, $3, to_timestamp($4), $5, NOW())
+       ON CONFLICT (athlete_id)
+       DO UPDATE SET
+         access_token = EXCLUDED.access_token,
+         refresh_token = EXCLUDED.refresh_token,
+         expires_at = EXCLUDED.expires_at,
+         scope = EXCLUDED.scope,
+         updated_at = NOW()`,
+      [athlete.id, accessToken, refreshToken, expiresAt, Array.isArray(scope) ? scope.join(',') : scope ?? ''],
+    );
+
+    res.json({
+      message: 'OAuth tokens stored successfully',
+      athlete: { id: athlete.id, firstname: athlete.firstname, lastname: athlete.lastname },
+    });
+  } catch (err) {
+    console.error('Failed to handle OAuth callback', err);
+    if (axios.isAxiosError?.(err)) {
+      res.status(err.response?.status ?? 500).json({
+        error: err.response?.data ?? err.message,
+      });
+    } else {
+      res.status(500).json({ error: err.message });
+    }
+  }
 });
 
 async function start() {
