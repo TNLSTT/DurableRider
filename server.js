@@ -137,10 +137,11 @@ app.get('/webhook', (req, res) => {
   }
 });
 
-app.post('/webhook', rateLimiter, async (req, res) => {
-  const body = req.body;
-  res.status(202).json({ received: true });
+app.post('/webhook', rateLimiter, (req, res) => {
+  console.log('📡 Received webhook event:', JSON.stringify(req.body, null, 2));
+  res.status(200).send('EVENT_RECEIVED');
 
+  const body = req.body;
   if (!body) {
     return;
   }
@@ -149,7 +150,7 @@ app.post('/webhook', rateLimiter, async (req, res) => {
 
   if (updates?.authorized === 'false' && athleteId) {
     console.log(`Athlete ${athleteId} deauthorized. Deleting tokens.`);
-    await deleteAthleteToken(athleteId);
+    void deleteAthleteToken(athleteId);
     return;
   }
 
@@ -159,11 +160,9 @@ app.post('/webhook', rateLimiter, async (req, res) => {
       return;
     }
 
-    try {
-      await enqueueActivity({ athleteId: Number(athleteId), activityId: Number(activityId) });
-    } catch (error) {
+    void enqueueActivity({ athleteId: Number(athleteId), activityId: Number(activityId) }).catch((error) => {
       console.error('Failed to enqueue activity', error);
-    }
+    });
   }
 });
 
