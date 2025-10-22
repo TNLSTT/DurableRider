@@ -155,58 +155,73 @@
       <header>
         <h1>DurableRider</h1>
         <p>
-          DurableRider turns raw Strava activity webhooks into reliable, durable data pipelines.
-          We queue, reprocess, and harden every ride so you can ship athlete features without losing
-          sleep over dropped events.
+          DurableRider listens to your Strava webhooks, rebuilds each activity with durability
+          analytics, and writes the finished metrics straight back to your feed. Every ride ends up
+          with fatigue-aware power breakdowns, efficiency trends, and a durability score you can
+          trust.
         </p>
         <div class="cta-group">
           <a class="cta" href="/oauth/start">Connect with Strava</a>
-          <a class="cta secondary" href="#learn-more">See how it works</a>
+          <a class="cta secondary" href="#learn-more">See the metrics</a>
         </div>
       </header>
 
       <section class="highlights" id="learn-more">
         <article class="highlight">
-          <h3>Durable ingest</h3>
+          <h3>Durability Score overlay</h3>
           <p>
-            Activities stream in from Strava and land in a resilient queue backed by Redis and
-            BullMQ. No more missed rides when Strava hiccups.
+            We combine power fade, heart-rate drift, and efficiency decline into a single 0–100
+            durability score that posts to the activity description so athletes can compare rides at
+            a glance.
           </p>
         </article>
         <article class="highlight">
-          <h3>Auto-retry processing</h3>
+          <h3>Power fade breakdown</h3>
           <p>
-            Each activity flows through our worker that enriches, sanitizes, and persists final
-            metrics into Postgres or S3 with built-in retry logic.
+            Quartile power tables highlight how output changes from the opening hour to the final
+            stretch, showing when fatigue started to bite and how much power was lost.
           </p>
         </article>
         <article class="highlight">
-          <h3>Instant webhooks</h3>
+          <h3>Heart-rate decoupling</h3>
           <p>
-            OAuth, verification, and webhook endpoints are ready out of the box so you can plug
-            DurableRider directly into your athlete experience.
+            We track efficiency factor and watts-per-heartbeat drift, then append a summary that
+            flags any sections where cardiovascular load spiked relative to power.
+          </p>
+        </article>
+        <article class="highlight">
+          <h3>Fatigue-resistance curve</h3>
+          <p>
+            Rolling best-effort charts for 5, 10, 20, and 60 minutes land as images in your Strava
+            gallery so riders can see how deep into the ride they can surge.
           </p>
         </article>
       </section>
 
       <section class="metrics">
         <div class="metric">
-          <strong>3x</strong>
-          <span>More reliable than direct Strava calls thanks to queue-driven processing.</span>
+          <strong>87</strong>
+          <span>Durability score on last Saturday&apos;s long ride, calculated from power fade, EF, and HR
+          drift.</span>
         </div>
         <div class="metric">
-          <strong>&lt;2m</strong>
-          <span>Average processing time for new rides during peak traffic.</span>
+          <strong>-11%</strong>
+          <span>Power fade from first to fourth quartile, captured in the posted ride summary.</span>
         </div>
         <div class="metric">
-          <strong>100%</strong>
-          <span>Of OAuth tokens stored with encryption-at-rest best practices.</span>
+          <strong>+6%</strong>
+          <span>Heart-rate decoupling flagged when efficiency factor dropped late in the ride.</span>
+        </div>
+        <div class="metric">
+          <strong>298 W</strong>
+          <span>Best rolling 5-minute power at the 2h mark, surfaced in the fatigue-resistance chart.</span>
         </div>
       </section>
 
       <footer>
-        Built for teams who live on top of Strava&apos;s webhooks. Dive into the code or reach out via
-        the <a href="https://github.com/">project repository</a> to collaborate.
+        Built for teams who need durability analytics to live inside Strava itself. Dive into the
+        code or reach out via the <a href="https://github.com/">project repository</a> to
+        collaborate.
       </footer>
     </main>
   </body>
