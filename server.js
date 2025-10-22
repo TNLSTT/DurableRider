@@ -1,6 +1,8 @@
 import 'dotenv/config';
 import express from 'express';
 import http from 'http';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { ensureSchema as ensureDbSchema, deleteAthleteToken } from './lib/db.js';
 import { initializeQueue, enqueueActivity, startQueueMonitor } from './lib/queue.js';
 import { processActivity } from './lib/activityProcessor.js';
@@ -13,6 +15,9 @@ import {
 // ===============================
 // Express + Core Setup
 // ===============================
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 const app = express();
 console.log('✅ Express initialized');
 
@@ -30,6 +35,8 @@ app.use((req, res, next) => {
 
   next();
 });
+
+app.use(express.static(path.join(__dirname, 'public')));
 
 // Capture low-level socket connections
 app.on('connection', (socket) => {
