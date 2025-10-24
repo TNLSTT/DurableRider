@@ -17,11 +17,11 @@ async function main() {
   }
 
   try {
-    const token = await getValidToken(athleteId);
-    const activity = await fetchActivity(token, activityId);
+    const { accessToken } = await getValidToken(athleteId);
+    const activity = await fetchActivity(accessToken, activityId);
     console.log('Current description:\n', activity.description ?? '');
     const newDescription = `${activity.description ?? ''}\n\nManual test append @ ${new Date().toISOString()}`;
-    await updateActivityDescription(token, activityId, newDescription);
+    await updateActivityDescription(accessToken, activityId, newDescription);
     console.log('Updated description successfully.');
   } catch (error) {
     console.error('Manual test failed', error);

@@ -3,7 +3,12 @@ import express from 'express';
 import http from 'http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ensureSchema as ensureDbSchema, deleteAthleteToken } from './lib/db.js';
+import {
+  ensureSchema as ensureDbSchema,
+  deleteAthleteToken,
+  updateAthleteAnalysisProfile,
+  getAthleteAnalysisProfile,
+} from './lib/db.js';
 import { initializeQueue, enqueueActivity, startQueueMonitor } from './lib/queue.js';
 import { processActivity } from './lib/activityProcessor.js';
 import {
@@ -11,6 +16,7 @@ import {
   exchangeOAuthToken,
   upsertAthleteTokenFromOAuth,
 } from './lib/strava.js';
+import { listProfiles, resolveProfileKey, isValidProfileKey, DEFAULT_PROFILE } from './lib/analysisProfiles/index.js';
 
 // ===============================
 // Express + Core Setup
@@ -110,16 +116,23 @@ app.get('/oauth/callback', async (req, res) => {
     const oauthData = await exchangeOAuthToken(code);
     console.log('✅ OAuth token exchange succeeded');
 
+    const requestedProfileRaw = Array.isArray(req.query.profile) ? req.query.profile[0] : req.query.profile;
+    const selectedProfile = resolveProfileKey(requestedProfileRaw ?? DEFAULT_PROFILE);
+
     if (!dbConfigured) {
       console.warn('⚠️ OAuth succeeded but DATABASE_URL is not configured. Tokens not persisted.');
-      res.status(200).json({ message: 'OAuth success (tokens not persisted)', athlete: oauthData.athlete });
+      res.status(200).json({
+        message: 'OAuth success (tokens not persisted)',
+        athlete: oauthData.athlete,
+        analysisProfile: selectedProfile,
+      });
       return;
     }
 
     try {
-      await upsertAthleteTokenFromOAuth(oauthData);
-      console.log(`💾 Stored tokens for athlete ${oauthData.athleteId}`);
-      res.json({ message: 'OAuth success', athlete: oauthData.athlete });
+      const stored = await upsertAthleteTokenFromOAuth(oauthData, { analysisProfile: selectedProfile });
+      console.log(`💾 Stored tokens for athlete ${oauthData.athleteId} with profile ${stored.analysisProfile}`);
+      res.json({ message: 'OAuth success', athlete: stored.athlete, analysisProfile: stored.analysisProfile });
     } catch (dbError) {
       console.error('❌ Failed to persist OAuth tokens:', dbError);
       res.status(500).json({ error: 'Failed to persist tokens. Please try again later.' });
@@ -127,6 +140,67 @@ app.get('/oauth/callback', async (req, res) => {
   } catch (err) {
     console.error('❌ /oauth/callback failed:', err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/analysis-profiles', (req, res) => {
+  res.json({ profiles: listProfiles(), default: DEFAULT_PROFILE });
+});
+
+app.get('/api/athletes/:athleteId/analysis-profile', async (req, res) => {
+  if (!dbConfigured) {
+    res.status(503).json({ error: 'Database not configured' });
+    return;
+  }
+
+  const athleteId = Number.parseInt(req.params.athleteId, 10);
+  if (!Number.isFinite(athleteId)) {
+    res.status(400).json({ error: 'Invalid athlete ID' });
+    return;
+  }
+
+  try {
+    const profile = await getAthleteAnalysisProfile(athleteId);
+    res.json({ athleteId, analysisProfile: profile ?? DEFAULT_PROFILE });
+  } catch (err) {
+    console.error('❌ Failed to fetch athlete analysis profile', err);
+    res.status(500).json({ error: 'Unable to load analysis profile' });
+  }
+});
+
+app.post('/api/athletes/:athleteId/analysis-profile', async (req, res) => {
+  if (!dbConfigured) {
+    res.status(503).json({ error: 'Database not configured' });
+    return;
+  }
+
+  const athleteId = Number.parseInt(req.params.athleteId, 10);
+  if (!Number.isFinite(athleteId)) {
+    res.status(400).json({ error: 'Invalid athlete ID' });
+    return;
+  }
+
+  const requestedProfile = req.body?.analysisProfile;
+  if (!requestedProfile) {
+    res.status(400).json({ error: 'analysisProfile is required' });
+    return;
+  }
+
+  const normalizedInput = String(requestedProfile).trim().toLowerCase();
+  const resolved = resolveProfileKey(requestedProfile);
+  const matchesKey = isValidProfileKey(normalizedInput);
+  const matchesLabel = listProfiles().some((profile) => profile.label.toLowerCase() === normalizedInput);
+  if (!matchesKey && !matchesLabel) {
+    res.status(400).json({ error: 'Unknown analysis profile' });
+    return;
+  }
+
+  try {
+    await updateAthleteAnalysisProfile({ athleteId, analysisProfile: resolved });
+    res.json({ athleteId, analysisProfile: resolved });
+  } catch (err) {
+    console.error('❌ Failed to update athlete analysis profile', err);
+    res.status(500).json({ error: 'Unable to update analysis profile' });
   }
 });
 
